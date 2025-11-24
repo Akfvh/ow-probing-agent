@@ -50,7 +50,10 @@ type ContainerState struct {
 	CurrentLimit int64 // Current memory limit (source of truth for memory usage)
 	TargetLimit int64 // Target memory limit for probing
 	FinalTargetLimit int64 // Final target memory limit
-	InvocationCount int64 // Number of invocations
+
+	InvocationCount int64 // Total invocations
+	StepInvocationCount int64 // Invocation count since last probe
+
 	Category ProbeCategory // Probing degree
 	State ProbeState // Probing state
 
@@ -61,11 +64,19 @@ type ContainerState struct {
 	LastCommitTime time.Time // Time when last committed
 
 	psiFD int // File descriptor for EPOLL
+
+	lastThrottledLimit int64 // Last throttled limit
+	consecutiveThrottles int // Number of consecutive throttles
+
+	committed bool
 }
 
 var (
 	containersMu sync.RWMutex
 	containers = make(map[string]*ContainerState)
+
+	commitsMu sync.Mutex
+	commits []ProbeCompleteReport
 )
 
 // -- heuristics --
@@ -81,12 +92,23 @@ const (
 	lightMaxFractionOfMax = 0.80
 	lightSafetyMultiplier = 2.0
 
+	maxBackoffInterval = 60 * time.Second
 	backoffInterval = 10 * time.Second
 	backoffFactor = 1.5 // increase target limit by 50% if throttled
 
 	minStepBytes = 16 * 1024 * 1024 // 16MB
 	initialProbeInterval = 10 * time.Second
 	maxThrottleBeforeDisable = 2
+)
+
+const (
+	minStepInvocationCount = 1 // min invocation count before next probe
+	maxProbeStepsPerSession = 10 // safety cap
+)
+
+const (
+	commitStableDuration = 10 * time.Second
+	commitMinInvocations = 3
 )
 
 
@@ -216,17 +238,85 @@ func markThrottled(containerID string) {
 	now := time.Now()
 	prevState := st.State
 
-	if prevState == ProbeIdle {
-		st.TargetLimit = st.CurrentLimit
+	st.lastThrottledLimit = st.TargetLimit
+	st.ThrottleCount++
+
+	// Throttled consecutively
+	if prevState == ProbeThrottled {
+		st.consecutiveThrottles++
+	} else {
+		st.consecutiveThrottles = 1
 	}
 
 	st.State = ProbeThrottled
 	st.LastThrottleTime = now
-	st.ThrottleCount++
 	userMax := st.UserMax
 	containersMu.Unlock()
 
 	setMemHigh(containerID, userMax)
 
 	log.Printf("Container %s throttled. Last throttle time: %s, Throttle count: %d", containerID, now, st.ThrottleCount)
+}
+
+func shouldDisableProbing(st *ContainerState) bool {
+	ratio := float64(st.CurrentLimit) / float64(st.UserMax)
+
+	// disable probing if throttled near max limit
+	// trivial gain from probing
+	if ratio >= 0.9 {
+		return true
+	}
+
+	switch st.Category {
+	case CategoryLight:
+		return st.ThrottleCount >= 4 || st.consecutiveThrottles >= 2
+	case CategoryMedium:
+		return st.ThrottleCount >= 3 || st.consecutiveThrottles >= 2
+	default:
+		return true // no downsize category
+	}
+}
+
+func effectiveBackoffInterval(st *ContainerState) time.Duration {
+	// first throttle
+	if st.ThrottleCount <= 1 {
+		return backoffInterval
+	}
+
+	// exponential backoff
+	factor := 1 << (st.ThrottleCount - 1)
+	d := time.Duration(factor) * backoffInterval
+	if d > maxBackoffInterval {
+		return maxBackoffInterval
+	}
+	return d
+}
+
+func maybeCommit(c *ContainerState, now time.Time) {
+	if c.committed {
+		return
+	}
+	if c.CurrentLimit >= c.UserMax - minStepBytes {
+		return
+	}
+	if now.Sub(c.LastCommitTime) < commitStableDuration {
+		return
+	}
+	if c.InvocationCount < commitMinInvocations {
+		return
+	}
+	if !c.LastThrottleTime.IsZero() && c.LastThrottleTime.After(c.LastCommitTime) {
+		return
+	}
+
+	c.committed = true
+	newLimit := c.CurrentLimit
+
+	commitsMu.Lock()
+	commits = append(commits, ProbeCompleteReport{
+		ContainerID: c.ContainerID,
+		Downsized: true,
+		NewLimitBytes: newLimit,
+	})
+	commitsMu.Unlock()
 }

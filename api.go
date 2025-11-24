@@ -21,6 +21,10 @@ type ProbeCompleteReport struct {
 	NewLimitBytes int64 `json:"new_limit_bytes"`
 }
 
+type ListCommittedResponse struct {
+	Items []ProbeCompleteReport `json:"items"`
+}
+
 type ReclaimedBytesResponse struct {
 	ReclaimedBytes int64 `json:"reclaimed_bytes"`
 }

@@ -37,6 +37,7 @@ func main() {
 	http.HandleFunc("/containers/remove", handleRemoveContainer) // remove container from monitoring batch
 	http.HandleFunc("/reclaimed", handleGetReclaimedMemory) // get reclaimed memory snapshot
 	http.HandleFunc("/containers/update", handleUpdateProbing) // update probing for container
+	http.HandleFunc("/commits", handleGetCommits) // get committed containers
 
 	addr := fmt.Sprintf(":%d", *httpPort)
 	log.Printf("Listening on %s", addr)
@@ -157,13 +158,14 @@ func handleUpdateProbing(w http.ResponseWriter, r *http.Request) {
 
 	containersMu.Lock()
 	if container, ok := containers[req.ContainerID]; ok {
-		container.InvocationCount++
-		invocationCount = container.InvocationCount
+		container.StepInvocationCount++ // aggregate to total upon stepping
+		invocationCount = container.InvocationCount + container.StepInvocationCount
 		found = true
-
-		if container.State == ProbeProbing {
-			container.ProbingStartTime = time.Now()
-		}
+		
+		// TODO. decide whether to reset timer on invocation or not
+		// if container.State == ProbeProbing {
+		// 	container.ProbingStartTime = time.Now()
+		// }
 	}
 	containersMu.Unlock()
 
@@ -171,6 +173,31 @@ func handleUpdateProbing(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Invocation count for container %s: %d", req.ContainerID, invocationCount)
 	} else {
 		log.Printf("Container %s not found in monitoring map", req.ContainerID)
+	}
+}
+
+func handleGetCommits(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	defer r.Body.Close()
+
+	commitsMu.Lock()
+	items := make([]ProbeCompleteReport, len(commits))
+	copy(items, commits)
+	commits = nil
+	commitsMu.Unlock()
+
+	resp := ListCommittedResponse{
+		Items: items,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("Failed to encode commits: %v", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
 	}
 }
 
@@ -220,13 +247,14 @@ func startMonitoring(containerID string) error {
 
 	// put container in monitoring map
 	containersMu.Lock()
-	containers[containerID] = &ContainerState{
+	container := &ContainerState{
 		ContainerID: containerID,
 		UserMax: memoryMax,
 		CurrentLimit: memoryMax,
 		TargetLimit: nextTarget,
 		FinalTargetLimit: finalTargetHigh,
 		InvocationCount: 0,
+		StepInvocationCount: 0,
 		Category: category,
 		State: ProbeProbing,
 		ProbingStartTime: now,
@@ -235,7 +263,23 @@ func startMonitoring(containerID string) error {
 		ProbeInterval: initialProbeInterval,
 		LastCommitTime: now,
 		psiFD: psiFD,
+		lastThrottledLimit: memoryMax,
+		consecutiveThrottles: 0,
+		committed: false,
 	}
+
+	if nextTarget == memoryMax {
+		container.State = ProbeIdle
+		container.committed = true
+		commitsMu.Lock()
+		commits = append(commits, ProbeCompleteReport{
+			ContainerID: containerID,
+			Downsized: false,
+			NewLimitBytes: memoryMax,
+		})
+		commitsMu.Unlock()
+	}
+	containers[containerID] = container
 	containersMu.Unlock()
 
 	// add to psi map
@@ -357,18 +401,24 @@ func updateProbingStates() {
 		switch container.State {
 		case ProbeIdle:
 			containersPerState[ProbeIdle]++
+			maybeCommit(container, now)
 			continue
 		case ProbeProbing:
 			containersPerState[ProbeProbing]++
 			// probing in progress
-			if now.Sub(container.ProbingStartTime) < container.ProbeInterval {
+			if now.Sub(container.ProbingStartTime) < container.ProbeInterval ||
+			container.StepInvocationCount < minStepInvocationCount {
 				continue
 			}
 
-			// probing complete
+			// Probing Complete (step complete)
+			container.InvocationCount += container.StepInvocationCount
+			container.StepInvocationCount = 0
+			container.consecutiveThrottles = 0
 			container.CurrentLimit = container.TargetLimit
 			container.LastCommitTime = now
 
+			// Probing complete (final target reached)
 			if container.CurrentLimit <= container.FinalTargetLimit {
 				container.State = ProbeIdle
 				container.TargetLimit = container.CurrentLimit
@@ -376,9 +426,10 @@ func updateProbingStates() {
 				continue
 			}
 
-			// still higher than final target
+			// Next Probing Step
 			alpha := alphaFor(container.Category)
 			newTarget := nextProbeTarget(container.CurrentLimit, container.FinalTargetLimit, alpha, minStepBytes)
+			container.ProbingStartTime = now
 
 			// can't make further progress. park it.
 			if newTarget >= container.CurrentLimit {
@@ -389,7 +440,6 @@ func updateProbingStates() {
 			}
 
 			container.TargetLimit = newTarget
-			container.LastCommitTime = now
 			container.ProbeInterval = container.ProbeInterval * 2 // exponential backoff
 
 			changes = append(changes, memChange{id: container.ContainerID, limit: newTarget})
@@ -400,37 +450,44 @@ func updateProbingStates() {
 			containersPerState[ProbeThrottled]++
 			// current mem.high == userMax (throttled)
 			// drain bursts for a while, then decide whether to resume probing
-			if now.Sub(container.LastThrottleTime) < backoffInterval {
+			if now.Sub(container.LastThrottleTime) < effectiveBackoffInterval(container) {
 				continue
 			}
 
-			if container.ThrottleCount >= maxThrottleBeforeDisable {
+			container.StepInvocationCount = 0
+
+			// Decide disable probing
+			if shouldDisableProbing(container) {
 				// a noisy container. disable probing for this session.
+				container.committed = true
 				container.State = ProbeDisabled
 				container.TargetLimit = container.UserMax
+				commitsMu.Lock()
+				commits = append(commits, ProbeCompleteReport{
+					ContainerID: container.ContainerID,
+					Downsized: false,
+					NewLimitBytes: container.UserMax,
+				})
+				commitsMu.Unlock()
 				changes = append(changes, memChange{id: container.ContainerID, limit: container.UserMax})
 				log.Printf("Disabled probing for container %s with memory limit %dMB", container.ContainerID, container.UserMax / 1024 / 1024)
 				continue
 			}
 
-			// resume probing, but from a higher target
-			bumped := int64(float64(container.CurrentLimit) * backoffFactor)
-			if bumped < container.CurrentLimit {
-				bumped = container.CurrentLimit
-			}
-			if bumped > container.UserMax {
-				bumped = container.UserMax
+			// Resume probing, more gently
+			if container.Category == CategoryLight {
+				container.Category = CategoryMedium
 			}
 
-			// page-align
-			bumped = (bumped + 4095) & ^4095
-
-			container.TargetLimit = bumped
-			container.State = ProbeProbing
+			container.TargetLimit = container.CurrentLimit
 			container.ProbingStartTime = now
 			container.ProbeInterval = initialProbeInterval
-			changes = append(changes, memChange{id: container.ContainerID, limit: bumped})
-			log.Printf("Resumed probing container %s with memory limit %dMB", container.ContainerID, bumped / 1024 / 1024)
+			container.consecutiveThrottles = 0
+
+			changes = append(changes, memChange{id: container.ContainerID, limit: container.CurrentLimit})
+			log.Printf("Resumed probing container %s with memory limit %dMB", container.ContainerID, container.CurrentLimit / 1024 / 1024)
+
+			container.State = ProbeProbing
 
 		case ProbeDisabled:
 			containersPerState[ProbeDisabled]++
