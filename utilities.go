@@ -1,0 +1,232 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"sync"
+	"time"
+	"log"
+)
+
+type ContainerReclaim struct {
+	ContainerID string
+	UserMax int64
+	CurrentLimit int64
+	ReclaimedMemory int64
+	State ProbeState
+	Category ProbeCategory
+}
+
+type ReclaimedSnapshot struct {
+	Timestamp time.Time
+	TotalReclaimedMemory int64
+	Containers []ContainerReclaim
+}
+
+type memChange struct {
+	id string
+	limit int64
+}
+
+type ProbeState string
+const (
+	ProbeIdle ProbeState = "idle"
+	ProbeProbing ProbeState = "probing"
+	ProbeThrottled ProbeState = "throttled"
+	ProbeDisabled ProbeState = "disabled"
+)
+
+type ProbeCategory string
+const (
+	CategoryNoDownsize ProbeCategory = "no_downsize"
+	CategoryLight ProbeCategory = "light"
+	CategoryMedium ProbeCategory = "medium"
+	CategoryHeavy ProbeCategory = "heavy"
+)
+
+type ContainerState struct {
+	ContainerID string // container ID
+	UserMax int64 // Origianl memory limit, OOM threshold
+	CurrentLimit int64 // Current memory limit (source of truth for memory usage)
+	TargetLimit int64 // Target memory limit for probing
+	FinalTargetLimit int64 // Final target memory limit
+	InvocationCount int64 // Number of invocations
+	Category ProbeCategory // Probing degree
+	State ProbeState // Probing state
+
+	ProbingStartTime time.Time // Time when probing started
+	LastThrottleTime time.Time // Time when last throttled
+	ThrottleCount int // Number of times throttled
+	ProbeInterval time.Duration // Time between probes
+	LastCommitTime time.Time // Time when last committed
+
+	psiFD int // File descriptor for EPOLL
+}
+
+var (
+	containersMu sync.RWMutex
+	containers = make(map[string]*ContainerState)
+)
+
+// -- heuristics --
+
+const (
+	heavyUsageRatio = 0.85
+	mediumUsageRatio = 0.50
+
+	mediumMinFractionOfMax = 0.60
+	mediumMaxFractionOfMax = 0.90
+	mediumSafetyMultiplier = 1.5
+	lightMinFractionOfMax = 0.25
+	lightMaxFractionOfMax = 0.80
+	lightSafetyMultiplier = 2.0
+
+	backoffInterval = 10 * time.Second
+	backoffFactor = 1.5 // increase target limit by 50% if throttled
+
+	minStepBytes = 16 * 1024 * 1024 // 16MB
+	initialProbeInterval = 10 * time.Second
+	maxThrottleBeforeDisable = 2
+)
+
+
+func clampBytes(raw int64, min int64, max int64) int64 {
+	if raw < min {
+		return min
+	}
+	if raw > max {
+		return max
+	}
+	return raw
+}
+
+// decide final target based on first invocation of the session
+func computeTargetHigh(userMaxBytes, firstPeakBytes int64) (int64, ProbeCategory) {
+    if userMaxBytes <= 0 || firstPeakBytes <= 0 {
+        return userMaxBytes, CategoryNoDownsize
+    }
+
+    ratio := float64(firstPeakBytes) / float64(userMaxBytes)
+
+    // 1) Very heavy usage: >= 80% of userMax -> don't mess with it
+    if ratio >= 0.80 {
+        return userMaxBytes, CategoryNoDownsize
+    }
+
+    // 2) Medium: 50–80% of userMax
+    if ratio >= 0.50 {
+        // target ~ 1.25 * peak, but keep it between 65% and 90% of userMax
+        base := int64(float64(firstPeakBytes) * 1.25)
+        minB := int64(0.65 * float64(userMaxBytes))
+        maxB := int64(0.90 * float64(userMaxBytes))
+		valClamped := clampBytes(base, minB, maxB)
+		valAligned := (valClamped + 4095) & ^4095
+        return valAligned, CategoryMedium
+    }
+
+    // 3) Light: 20–50% of userMax (sharper)
+    if ratio >= 0.20 {
+        // more aggressive: ~1.6 * peak, clamped to [30%, 65%] of userMax
+        base := int64(float64(firstPeakBytes) * 1.6)
+        minB := int64(0.30 * float64(userMaxBytes))
+        maxB := int64(0.65 * float64(userMaxBytes))
+        valClamped := clampBytes(base, minB, maxB)
+		valAligned := (valClamped + 4095) & ^4095
+        return valAligned, CategoryLight
+    }
+
+    // 4) Ultra-light: <20% of userMax (very aggressive)
+    // e.g. tiny peak relative to max, likely overprovisioned
+    base := int64(float64(firstPeakBytes) * 2.0)
+    minB := int64(0.20 * float64(userMaxBytes))
+    maxB := int64(0.50 * float64(userMaxBytes))
+    valClamped := clampBytes(base, minB, maxB)
+	valAligned := (valClamped + 4095) & ^4095
+    return valAligned, CategoryLight
+}
+
+
+func setMemHigh(containerID string, targetHigh int64) {
+	path := cgroupPathFor(containerID, "memory.high")
+	data := []byte(fmt.Sprintf("%d", targetHigh))
+	err := os.WriteFile(path, data, 0644)
+	if err != nil {
+		log.Printf("Failed to set mem high for container %s: %v", containerID, err)
+	}
+}
+
+func cgroupPathFor(containerID string, filename string) string {
+	return fmt.Sprintf("/sys/fs/cgroup/docker/%s/%s", containerID, filename)
+}
+
+func nextProbeTarget(currentLimit int64, finalTargetLimit int64, alpha float64, minStepBytes int64) int64 {
+	if currentLimit <= finalTargetLimit {
+		return currentLimit
+	}
+	cand := int64(float64(currentLimit)*(1-alpha) + float64(finalTargetLimit)*alpha)
+
+	if cand < finalTargetLimit {
+		cand = finalTargetLimit
+	}
+
+	step := currentLimit - cand
+	if step < minStepBytes {
+		cand = currentLimit - minStepBytes
+		if cand < finalTargetLimit {
+			cand = finalTargetLimit
+		}
+	}
+
+	// page align
+	cand = (cand + 4095) & ^4095
+
+	if cand < finalTargetLimit {
+		cand = finalTargetLimit
+	}
+
+	return cand
+}
+
+func alphaFor(category ProbeCategory) float64 {
+	switch category {
+	case CategoryLight:
+		return 0.6
+	case CategoryMedium:
+		return 0.35
+	default:
+		return 0.0
+	}
+}
+
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func markThrottled(containerID string) {
+	containersMu.Lock()
+	st, ok := containers[containerID]
+	if !ok {
+		containersMu.Unlock()
+		return
+	}
+
+	now := time.Now()
+	prevState := st.State
+
+	if prevState == ProbeIdle {
+		st.TargetLimit = st.CurrentLimit
+	}
+
+	st.State = ProbeThrottled
+	st.LastThrottleTime = now
+	st.ThrottleCount++
+	userMax := st.UserMax
+	containersMu.Unlock()
+
+	setMemHigh(containerID, userMax)
+
+	log.Printf("Container %s throttled. Last throttle time: %s, Throttle count: %d", containerID, now, st.ThrottleCount)
+}
