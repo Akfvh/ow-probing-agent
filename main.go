@@ -479,7 +479,17 @@ func updateProbingStates() {
 				container.Category = CategoryMedium
 			}
 
-			container.TargetLimit = container.CurrentLimit
+			// Apply backoffFactor to target limit (don't retry the same failing limit immediately)
+			// TargetLimit = CurrentLimit * backoffFactor
+			// but clamp to UserMax
+			newLimit := int64(float64(container.CurrentLimit) * backoffFactor)
+			if newLimit > container.UserMax {
+				newLimit = container.UserMax
+			}
+			// page align
+			newLimit = (newLimit + 4095) & ^4095
+			container.TargetLimit = newLimit
+
 			container.ProbingStartTime = now
 			container.ProbeInterval = initialProbeInterval
 			container.consecutiveThrottles = 0

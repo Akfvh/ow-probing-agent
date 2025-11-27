@@ -131,27 +131,27 @@ func computeTargetHigh(userMaxBytes, firstPeakBytes int64) (int64, ProbeCategory
     ratio := float64(firstPeakBytes) / float64(userMaxBytes)
 
     // 1) Very heavy usage: >= 80% of userMax -> don't mess with it
-    if ratio >= 0.80 {
+    if ratio >= heavyUsageRatio {
         return userMaxBytes, CategoryNoDownsize
     }
 
     // 2) Medium: 50–80% of userMax
-    if ratio >= 0.50 {
+    if ratio >= mediumUsageRatio {
         // target ~ 1.25 * peak, but keep it between 65% and 90% of userMax
-        base := int64(float64(firstPeakBytes) * 1.25)
-        minB := int64(0.65 * float64(userMaxBytes))
-        maxB := int64(0.90 * float64(userMaxBytes))
+        base := int64(float64(firstPeakBytes) * mediumSafetyMultiplier)
+        minB := int64(mediumMinFractionOfMax * float64(userMaxBytes))
+        maxB := int64(mediumMaxFractionOfMax * float64(userMaxBytes))
 		valClamped := clampBytes(base, minB, maxB)
 		valAligned := (valClamped + 4095) & ^4095
         return valAligned, CategoryMedium
     }
 
     // 3) Light: 20–50% of userMax (sharper)
-    if ratio >= 0.20 {
+    if ratio >= lightMinFractionOfMax {
         // more aggressive: ~1.6 * peak, clamped to [30%, 65%] of userMax
-        base := int64(float64(firstPeakBytes) * 1.6)
+        base := int64(float64(firstPeakBytes) * lightSafetyMultiplier)
         minB := int64(0.30 * float64(userMaxBytes))
-        maxB := int64(0.65 * float64(userMaxBytes))
+        maxB := int64(lightMaxFractionOfMax * float64(userMaxBytes))
         valClamped := clampBytes(base, minB, maxB)
 		valAligned := (valClamped + 4095) & ^4095
         return valAligned, CategoryLight
@@ -159,12 +159,12 @@ func computeTargetHigh(userMaxBytes, firstPeakBytes int64) (int64, ProbeCategory
 
     // 4) Ultra-light: <20% of userMax (very aggressive)
     // e.g. tiny peak relative to max, likely overprovisioned
-    base := int64(float64(firstPeakBytes) * 2.0)
+    base := int64(float64(firstPeakBytes) * 2.5)
     minB := int64(0.20 * float64(userMaxBytes))
     maxB := int64(0.50 * float64(userMaxBytes))
     valClamped := clampBytes(base, minB, maxB)
 	valAligned := (valClamped + 4095) & ^4095
-    return valAligned, CategoryLight
+    return valAligned, CategoryHeavy
 }
 
 
@@ -211,6 +211,8 @@ func nextProbeTarget(currentLimit int64, finalTargetLimit int64, alpha float64, 
 
 func alphaFor(category ProbeCategory) float64 {
 	switch category {
+	case CategoryHeavy:
+		return 0.8 // very aggressive approach
 	case CategoryLight:
 		return 0.6
 	case CategoryMedium:
