@@ -1,12 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"net/http"
 	"fmt"
 	"os"
 	"sync"
 	"time"
 	"log"
 )
+
+type CommitPayload struct {
+	ContainerID string `json:"containerId"`
+	NewLimitMB int64 `json:"newLimitMB"`
+}
 
 type ContainerReclaim struct {
 	ContainerID string
@@ -111,6 +119,71 @@ const (
 	commitMinInvocations = 3
 )
 
+
+func startPushingCommits(bridgeURL string) {
+	ticker := time.NewTicker(1 * time.Second)
+	for range ticker.C {
+		pushCommits(bridgeURL)
+	}
+}
+
+func pushCommits(bridgeURL string) {
+	commitsMu.Lock()
+	if len(commits) == 0 {
+		commitsMu.Unlock()
+		return
+	}
+
+	// move current commits to a new slice
+	pending := make([]ProbeCompleteReport, len(commits))
+	copy(pending, commits)
+	commits = nil
+	commitsMu.Unlock()
+
+	// transform to commit payload
+	var payload []CommitPayload
+	for _, commit := range pending {
+		mbVal := int(commit.NewLimitMB)
+		if mbVal < 1 {
+			mbVal = 1
+		}
+
+		payload = append(payload, CommitPayload{
+			ContainerID: commit.ContainerID,
+			NewLimitMB: int64(mbVal),
+		})
+	}
+
+	jsonData, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Failed to marshal commits: %v", err)
+		restoreCommits(pending)
+		return
+	}
+
+	resp, err := http.Post(bridgeURL, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		log.Printf("Failed to push commits to bridge: %v", err)
+		restoreCommits(pending)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Failed to push commits to bridge: %s", resp.Status)
+		restoreCommits(pending)
+		return
+	}
+
+	log.Printf("[Pusher] Successfully pushed %d commits to bridge", len(payload))
+}
+
+func restoreCommits(pending []ProbeCompleteReport) {
+	commitsMu.Lock()
+	// somehow failed to push, so defer the commits to the next tick
+	commits = append(commits, pending...)
+	commitsMu.Unlock()
+}
 
 func clampBytes(raw int64, min int64, max int64) int64 {
 	if raw < min {
@@ -316,7 +389,8 @@ func maybeCommit(c *ContainerState, now time.Time) {
 	commits = append(commits, ProbeCompleteReport{
 		ContainerID: c.ContainerID,
 		Downsized: true,
-		NewLimitBytes: newLimit,
+		NewLimitMB: newLimit,
 	})
 	commitsMu.Unlock()
 }
+

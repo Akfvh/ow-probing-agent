@@ -26,8 +26,11 @@ func main() {
 
 	httpPort := flag.Int("http-port", 8080, "Port to listen on for HTTP requests")
 	webhookPort := flag.Int("webhook-port", 50051, "Port to listen on for Webhook requests")
+	bridgeURL := flag.String("bridge-url", "http://172.17.0.1:50051/updateCommits", "URL of the bridge server for commits")
 
 	flag.Parse()
+
+	go startPushingCommits(*bridgeURL)
 
 	log.Printf(
 		"Starting OW Probing Agent on port %d (HTTP) and %d (Webhook)", *httpPort, *webhookPort)
@@ -37,7 +40,6 @@ func main() {
 	http.HandleFunc("/containers/remove", handleRemoveContainer) // remove container from monitoring batch
 	http.HandleFunc("/reclaimed", handleGetReclaimedMemory) // get reclaimed memory snapshot
 	http.HandleFunc("/containers/update", handleUpdateProbing) // update probing for container
-	http.HandleFunc("/commits", handleGetCommits) // get committed containers
 
 	addr := fmt.Sprintf(":%d", *httpPort)
 	log.Printf("Listening on %s", addr)
@@ -176,31 +178,6 @@ func handleUpdateProbing(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func handleGetCommits(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	defer r.Body.Close()
-
-	commitsMu.Lock()
-	items := make([]ProbeCompleteReport, len(commits))
-	copy(items, commits)
-	commits = nil
-	commitsMu.Unlock()
-
-	resp := ListCommittedResponse{
-		Items: items,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		log.Printf("Failed to encode commits: %v", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-}
-
 func handleGetReclaimedMemory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -275,7 +252,7 @@ func startMonitoring(containerID string) error {
 		commits = append(commits, ProbeCompleteReport{
 			ContainerID: containerID,
 			Downsized: false,
-			NewLimitBytes: memoryMax,
+			NewLimitMB: memoryMax / 1024 / 1024,
 		})
 		commitsMu.Unlock()
 	}
@@ -466,7 +443,7 @@ func updateProbingStates() {
 				commits = append(commits, ProbeCompleteReport{
 					ContainerID: container.ContainerID,
 					Downsized: false,
-					NewLimitBytes: container.UserMax,
+					NewLimitMB: container.UserMax / 1024 / 1024,
 				})
 				commitsMu.Unlock()
 				changes = append(changes, memChange{id: container.ContainerID, limit: container.UserMax})
