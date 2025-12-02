@@ -18,7 +18,7 @@ type ProbingResponse struct {
 type ProbeCompleteReport struct {
 	ContainerID string `json:"container_id"`
 	Downsized bool `json:"downsized"`
-	NewLimitMB int64 `json:"new_limit_mb"`
+	NewLimitBytes int64 `json:"new_limit_bytes"`
 }
 
 type ReclaimedBytesResponse struct {

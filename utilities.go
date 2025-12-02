@@ -13,7 +13,7 @@ import (
 
 type CommitPayload struct {
 	ContainerID string `json:"containerId"`
-	NewLimitMB int64 `json:"newLimitMB"`
+	NewLimitBytes int64 `json:"newLimitBytes"`
 }
 
 type ContainerReclaim struct {
@@ -143,14 +143,14 @@ func pushCommits(bridgeURL string) {
 	// transform to commit payload
 	var payload []CommitPayload
 	for _, commit := range pending {
-		mbVal := int(commit.NewLimitMB)
+		mbVal := int(commit.NewLimitBytes)
 		if mbVal < 1 {
 			mbVal = 1
 		}
 
 		payload = append(payload, CommitPayload{
 			ContainerID: commit.ContainerID,
-			NewLimitMB: int64(mbVal),
+			NewLimitBytes: int64(mbVal),
 		})
 	}
 
@@ -389,7 +389,7 @@ func maybeCommit(c *ContainerState, now time.Time) {
 	commits = append(commits, ProbeCompleteReport{
 		ContainerID: c.ContainerID,
 		Downsized: true,
-		NewLimitMB: newLimit,
+		NewLimitBytes: newLimit,
 	})
 	commitsMu.Unlock()
 }

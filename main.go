@@ -252,7 +252,7 @@ func startMonitoring(containerID string) error {
 		commits = append(commits, ProbeCompleteReport{
 			ContainerID: containerID,
 			Downsized: false,
-			NewLimitMB: memoryMax / 1024 / 1024,
+			NewLimitBytes: memoryMax,
 		})
 		commitsMu.Unlock()
 	}
@@ -417,7 +417,7 @@ func updateProbingStates() {
 			}
 
 			container.TargetLimit = newTarget
-			container.ProbeInterval = container.ProbeInterval * 2 // exponential backoff
+			// container.ProbeInterval = container.ProbeInterval * 2 // exponential backoff
 
 			changes = append(changes, memChange{id: container.ContainerID, limit: newTarget})
 			log.Printf("Lowered probing container %s with memory limit %dMB", container.ContainerID, newTarget / 1024 / 1024)
@@ -443,7 +443,7 @@ func updateProbingStates() {
 				commits = append(commits, ProbeCompleteReport{
 					ContainerID: container.ContainerID,
 					Downsized: false,
-					NewLimitMB: container.UserMax / 1024 / 1024,
+					NewLimitBytes: container.UserMax,
 				})
 				commitsMu.Unlock()
 				changes = append(changes, memChange{id: container.ContainerID, limit: container.UserMax})
