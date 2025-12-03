@@ -104,6 +104,7 @@ func epollLoop() {
 	}
 }
 
+// Quickly revert to original limit upon memory pressure event
 func handleMemoryPressureEvent(containerID string, fd int, ev unix.EpollEvent) {
 	// drain the event
 	buf := make([]byte, 4096)

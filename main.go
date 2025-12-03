@@ -61,6 +61,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(HealthCheckResponse{Status: "ok"})
 }
 
+// params: container_id, probe_time
 func handleAddContainer(w http.ResponseWriter, r *http.Request) {
 	beginTime := time.Now()
 
@@ -83,9 +84,9 @@ func handleAddContainer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// for now, just log the request
-	log.Printf("Adding container %s for probing", req.ContainerID)
+	log.Printf("Adding container %s for probing. probe time: %d seconds", req.ContainerID, req.ProbeTime)
 
-	if err := startMonitoring(req.ContainerID); err != nil {
+	if err := startMonitoring(req.ContainerID, req.ProbeTime); err != nil {
 		http.Error(w, "Failed to start monitoring container", http.StatusInternalServerError)
 		return
 	}
@@ -199,19 +200,29 @@ func handleGetReclaimedMemory(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func startMonitoring(containerID string) error {
+func startMonitoring(containerID string, probeTime int) error {
+	// initialize epoll, only once
 	initEpoll()
 
-	// examine container specs
+	// examine first invocation.
 	memoryMax, memoryPeak, memoryCur, err := getContainerSpecs(containerID)
 	if err != nil {
 		log.Printf("Failed to start monitoring container %s: %v", containerID, err)
 		return err
 	}
 
-	// compute target high
-	finalTargetHigh, category := computeTargetHigh(memoryMax, memoryPeak)
-	nextTarget := nextProbeTarget(memoryMax, finalTargetHigh, alphaFor(category), minStepBytes)
+	// compute safety floor. TODO: use history info
+	floor := computeSafetyFloor(memoryMax, memoryPeak)
+
+	// ssthresh init
+	ssthresh:= floor + (memoryMax - floor) / 2
+	if ssthresh < floor {
+		ssthresh = floor
+	}
+
+	// next target init
+	// nextTarget, mode := nextProbeTarget(memoryMax, floor, ssthresh)
+	nextTarget, _ := nextProbeTarget(memoryMax, floor, ssthresh)
 
 	// setup psi fd for EPOLL
 	psiFD, err := setupPsiFD(containerID)
@@ -229,10 +240,12 @@ func startMonitoring(containerID string) error {
 		UserMax: memoryMax,
 		CurrentLimit: memoryMax,
 		TargetLimit: nextTarget,
-		FinalTargetLimit: finalTargetHigh,
+		FinalTargetLimit: floor,
+		Ssthresh: ssthresh,
+		LastKnownPeak: memoryPeak,
 		InvocationCount: 0,
 		StepInvocationCount: 0,
-		Category: category,
+		Category: CategoryMedium,
 		State: ProbeProbing,
 		ProbingStartTime: now,
 		LastThrottleTime: time.Time{},
@@ -243,6 +256,7 @@ func startMonitoring(containerID string) error {
 		lastThrottledLimit: memoryMax,
 		consecutiveThrottles: 0,
 		committed: false,
+		ProbeTime: probeTime,
 	}
 
 	if nextTarget == memoryMax {
@@ -267,9 +281,23 @@ func startMonitoring(containerID string) error {
 	// set soft limit
 	setMemHigh(containerID, nextTarget)
 
-	// log.Printf("Started monitoring container %s at %s with memory max: %d, memory peak: %d, memory current: %d, target high: %d, category: %s", containerID, now, memoryMax, memoryPeak, memoryCur, targetHigh, category)
-	log.Printf("Started monitoring container %s with \nmemory max: %dMB\nmemory peak: %dMB\nmemory current: %dMB\nfinal target high: %dMB\ninitial target high: %dMB\ncategory: %s", containerID, memoryMax / 1024 / 1024, memoryPeak / 1024 / 1024, memoryCur / 1024 / 1024, finalTargetHigh / 1024 / 1024, nextTarget / 1024 / 1024, category)
-
+	// logging
+	log.Printf(
+		"Started monitoring container %s\n"+
+		"Memory max: %dMB\n"+
+		"Memory peak: %dMB\n"+
+		"Memory current: %dMB\n"+
+		"Safety floor: %dMB\n"+
+		"Ssthresh: %dMB\n"+
+		"Next target: %dMB]\n",
+		containerID, 
+		memoryMax / 1024 / 1024, 
+		memoryPeak / 1024 / 1024, 
+		memoryCur / 1024 / 1024, 
+		floor / 1024 / 1024, 
+		ssthresh / 1024 / 1024,
+		nextTarget / 1024 / 1024, 
+	)
 	return nil
 }
 
@@ -366,6 +394,7 @@ func getContainerMemoryCurrent(containerID string) (int64, error) {
 	return value, nil
 }
 
+// periodically update probing states of all containers we are watching
 func updateProbingStates() {
 	// tmp, DEBUG
 	var containersPerState = make(map[ProbeState]int)
@@ -384,7 +413,7 @@ func updateProbingStates() {
 			containersPerState[ProbeProbing]++
 			// probing in progress
 			if now.Sub(container.ProbingStartTime) < container.ProbeInterval ||
-			container.StepInvocationCount < minStepInvocationCount {
+				container.StepInvocationCount < minStepInvocationCount {
 				continue
 			}
 
@@ -404,8 +433,11 @@ func updateProbingStates() {
 			}
 
 			// Next Probing Step
-			alpha := alphaFor(container.Category)
-			newTarget := nextProbeTarget(container.CurrentLimit, container.FinalTargetLimit, alpha, minStepBytes)
+			// newTarget, mode := nextProbeTarget(container.CurrentLimit,
+			newTarget, _ := nextProbeTarget(container.CurrentLimit,
+				container.FinalTargetLimit,
+				container.Ssthresh,
+			)
 			container.ProbingStartTime = now
 
 			// can't make further progress. park it.
@@ -451,18 +483,15 @@ func updateProbingStates() {
 				continue
 			}
 
-			// Resume probing, more gently
-			if container.Category == CategoryLight {
-				container.Category = CategoryMedium
-			}
-
-			container.TargetLimit = container.CurrentLimit
+			// continue probing, but backoff by (max - current) / 2
+			backoff := (container.UserMax - container.CurrentLimit) / 2
+			container.TargetLimit = container.CurrentLimit - backoff
 			container.ProbingStartTime = now
 			container.ProbeInterval = initialProbeInterval
 			container.consecutiveThrottles = 0
 
-			changes = append(changes, memChange{id: container.ContainerID, limit: container.CurrentLimit})
-			log.Printf("Resumed probing container %s with memory limit %dMB", container.ContainerID, container.CurrentLimit / 1024 / 1024)
+			changes = append(changes, memChange{id: container.ContainerID, limit: container.TargetLimit})
+			log.Printf("Resumed probing container %s with memory limit %dMB", container.ContainerID, container.TargetLimit / 1024 / 1024)
 
 			container.State = ProbeProbing
 

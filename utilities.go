@@ -53,30 +53,41 @@ const (
 )
 
 type ContainerState struct {
-	ContainerID string // container ID
-	UserMax int64 // Origianl memory limit, OOM threshold
-	CurrentLimit int64 // Current memory limit (source of truth for memory usage)
-	TargetLimit int64 // Target memory limit for probing
-	FinalTargetLimit int64 // Final target memory limit
+	ContainerID string
 
-	InvocationCount int64 // Total invocations
-	StepInvocationCount int64 // Invocation count since last probe
+	// Limits
+	UserMax int64
+	CurrentLimit int64
+	TargetLimit int64
+	FinalTargetLimit int64
 
-	Category ProbeCategory // Probing degree
-	State ProbeState // Probing state
+	// Heuristics - control
+	Ssthresh int64
+	LastKnownPeak int64
 
-	ProbingStartTime time.Time // Time when probing started
-	LastThrottleTime time.Time // Time when last throttled
-	ThrottleCount int // Number of times throttled
-	ProbeInterval time.Duration // Time between probes
-	LastCommitTime time.Time // Time when last committed
+	// Invocation count
+	InvocationCount int64
+	StepInvocationCount int64
 
-	psiFD int // File descriptor for EPOLL
+	// Probing States
+	Category ProbeCategory
+	State ProbeState
+	
+	// Timing
+	ProbingStartTime time.Time
+	LastThrottleTime time.Time
+	ThrottleCount int
+	ProbeInterval time.Duration
+	LastCommitTime time.Time
 
-	lastThrottledLimit int64 // Last throttled limit
-	consecutiveThrottles int // Number of consecutive throttles
+	// PSI 
+	psiFD int
+
+	lastThrottledLimit int64
+	consecutiveThrottles int
 
 	committed bool
+	ProbeTime int
 }
 
 var (
@@ -107,6 +118,9 @@ const (
 	minStepBytes = 16 * 1024 * 1024 // 16MB
 	initialProbeInterval = 10 * time.Second
 	maxThrottleBeforeDisable = 2
+
+	InitialMarginRatio = 1.1
+	MinSafetyFloorBytes = 32 * 1024 * 1024 // 32MB
 )
 
 const (
@@ -120,8 +134,9 @@ const (
 )
 
 
+// push commits to bridge every 500ms
 func startPushingCommits(bridgeURL string) {
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	for range ticker.C {
 		pushCommits(bridgeURL)
 	}
@@ -196,48 +211,34 @@ func clampBytes(raw int64, min int64, max int64) int64 {
 }
 
 // decide final target based on first invocation of the session
-func computeTargetHigh(userMaxBytes, firstPeakBytes int64) (int64, ProbeCategory) {
+func computeSafetyFloor(userMaxBytes, firstPeakBytes int64) int64 {
     if userMaxBytes <= 0 || firstPeakBytes <= 0 {
-        return userMaxBytes, CategoryNoDownsize
+        return userMaxBytes
     }
 
     ratio := float64(firstPeakBytes) / float64(userMaxBytes)
 
-    // 1) Very heavy usage: >= 80% of userMax -> don't mess with it
+    // Heavy usage: don't mess with it
     if ratio >= 0.80 {
-        return userMaxBytes, CategoryNoDownsize
+        return userMaxBytes
     }
 
-    // 2) Medium: 50–80% of userMax
-    if ratio >= 0.50 {
-        // target ~ 1.25 * peak, but keep it between 65% and 90% of userMax
-        base := int64(float64(firstPeakBytes) * 1.25)
-        minB := int64(0.65 * float64(userMaxBytes))
-        maxB := int64(0.90 * float64(userMaxBytes))
-		valClamped := clampBytes(base, minB, maxB)
-		valAligned := (valClamped + 4095) & ^4095
-        return valAligned, CategoryMedium
-    }
+	target := int64(float64(firstPeakBytes) * InitialMarginRatio)
 
-    // 3) Light: 20–50% of userMax (sharper)
-    if ratio >= 0.20 {
-        // more aggressive: ~1.6 * peak, clamped to [30%, 65%] of userMax
-        base := int64(float64(firstPeakBytes) * 1.6)
-        minB := int64(0.30 * float64(userMaxBytes))
-        maxB := int64(0.65 * float64(userMaxBytes))
-        valClamped := clampBytes(base, minB, maxB)
-		valAligned := (valClamped + 4095) & ^4095
-        return valAligned, CategoryLight
-    }
+	//clamp min
+	if (target < MinSafetyFloorBytes) {
+		target = MinSafetyFloorBytes
+	}
 
-    // 4) Ultra-light: <20% of userMax (very aggressive)
-    // e.g. tiny peak relative to max, likely overprovisioned
-    base := int64(float64(firstPeakBytes) * 2.0)
-    minB := int64(0.20 * float64(userMaxBytes))
-    maxB := int64(0.50 * float64(userMaxBytes))
-    valClamped := clampBytes(base, minB, maxB)
-	valAligned := (valClamped + 4095) & ^4095
-    return valAligned, CategoryLight
+	//clamp max
+	if (target > userMaxBytes) {
+		target = userMaxBytes
+	}
+
+	// page align
+	targetAligned := (target + 4095) & ^4095
+
+	return targetAligned
 }
 
 
@@ -254,42 +255,50 @@ func cgroupPathFor(containerID string, filename string) string {
 	return fmt.Sprintf("/sys/fs/cgroup/docker/%s/%s", containerID, filename)
 }
 
-func nextProbeTarget(currentLimit int64, finalTargetLimit int64, alpha float64, minStepBytes int64) int64 {
-	if currentLimit <= finalTargetLimit {
-		return currentLimit
-	}
-	cand := int64(float64(currentLimit)*(1-alpha) + float64(finalTargetLimit)*alpha)
-
-	if cand < finalTargetLimit {
-		cand = finalTargetLimit
+// implement tcp-reno-like algorithm
+func nextProbeTarget(currentLimit, minFloor, ssthresh int64) (int64, string) {
+	// Safety clamp
+	if currentLimit < minFloor {
+		return minFloor, "FloorReached"
 	}
 
-	step := currentLimit - cand
-	if step < minStepBytes {
-		cand = currentLimit - minStepBytes
-		if cand < finalTargetLimit {
-			cand = finalTargetLimit
-		}
+	var (
+		nextLimit int64
+		mode string
+	)
+
+	// Descent phase: exponential || additive
+	if currentLimit > ssthresh { 
+		mode = "SlowStart"
+
+		gap := currentLimit - minFloor
+
+		// Reduce by max(half the gap, minStepBytes)
+		reduction := max(minStepBytes, int64(float64(gap) * 0.5))
+		nextLimit = currentLimit - reduction
+	} else {
+		mode = "CongestionAvoidance"
+		nextLimit = currentLimit - minStepBytes
 	}
 
+	// final min clamp
+	if nextLimit < minFloor {
+		nextLimit = minFloor
+	}
+	
 	// page align
-	cand = (cand + 4095) & ^4095
-
-	if cand < finalTargetLimit {
-		cand = finalTargetLimit
-	}
-
-	return cand
+	nextLimitAligned := (nextLimit + 4095) & ^4095
+	return nextLimitAligned, mode
 }
 
-func alphaFor(category ProbeCategory) float64 {
+func getControlParams(category ProbeCategory) (alpha, beta float64) {
 	switch category {
-	case CategoryLight:
-		return 0.6
-	case CategoryMedium:
-		return 0.35
-	default:
-		return 0.0
+	case CategoryLight: // aggressive descent. gain > safety
+		return 0.7, 0.5
+	case CategoryMedium: // medium descent. gain ~ safety
+		return 0.5, 0.5
+	default: // no downsize category. gain << safety
+		return 0.0, 0.0
 	}
 }
 
@@ -323,12 +332,47 @@ func markThrottled(containerID string) {
 
 	st.State = ProbeThrottled
 	st.LastThrottleTime = now
+
+	// Reno-style backoff
+	// ssthresh update
+	reclaimed := st.UserMax - st.CurrentLimit
+	half := reclaimed / 2
+	newLimit := st.UserMax - half
+
+	// clamp new limit
+	if newLimit < st.FinalTargetLimit {
+		newLimit = st.FinalTargetLimit
+	}
+	if newLimit < st.FinalTargetLimit {
+		newLimit = st.FinalTargetLimit
+	}
+	if newLimit > st.UserMax {
+		newLimit = st.UserMax
+	}
+
+	st.Ssthresh = newLimit
+
 	userMax := st.UserMax
+	throttleCount := st.ThrottleCount
+	consecutive := st.consecutiveThrottles
+	lastTarget := st.lastThrottledLimit
+
 	containersMu.Unlock()
 
+	// throttle handling
 	setMemHigh(containerID, userMax)
 
-	log.Printf("Container %s throttled. Last throttle time: %s, Throttle count: %d", containerID, now, st.ThrottleCount)
+	log.Printf("Container %s throttled." +
+		"Last throttle time: %s\n" +
+		"Throttle count: %d\n" +
+		"Consecutive: %d\n" +
+		"Last target: %dMB\n", 
+		containerID, 
+		now, 
+		throttleCount, 
+		consecutive, 
+		lastTarget / 1024 / 1024,
+	)
 }
 
 func shouldDisableProbing(st *ContainerState) bool {

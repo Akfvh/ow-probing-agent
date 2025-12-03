@@ -9,6 +9,7 @@ type HealthCheckResponse struct {
 // Used for Add/Remove/Update container
 type ProbingRequest struct {
 	ContainerID string `json:"container_id"`
+	ProbeTime int `json:"probe_time"`
 }
 type ProbingResponse struct {
 	Status string `json:"status"`
