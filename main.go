@@ -15,7 +15,7 @@ import (
 
 func main() {
 	// add a global ticker to check the status of all containers every 1 second
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
 	go func() {
@@ -27,10 +27,14 @@ func main() {
 	httpPort := flag.Int("http-port", 8080, "Port to listen on for HTTP requests")
 	webhookPort := flag.Int("webhook-port", 50051, "Port to listen on for Webhook requests")
 	bridgeURL := flag.String("bridge-url", "http://172.17.0.1:50051/updateCommits", "URL of the bridge server for commits")
+	bridgeBaseURL := flag.String("bridge-base-url", "http://172.17.0.1:50051", "Base URL of the bridge server")
 
 	flag.Parse()
 
 	go startPushingCommits(*bridgeURL)
+	
+	// Store bridge base URL for probe disabled notifications
+	bridgeBaseURLForDisabled = *bridgeBaseURL
 
 	log.Printf(
 		"Starting OW Probing Agent on port %d (HTTP) and %d (Webhook)", *httpPort, *webhookPort)
@@ -63,7 +67,7 @@ func handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // params: container_id, probe_time
 func handleAddContainer(w http.ResponseWriter, r *http.Request) {
-	beginTime := time.Now()
+	// beginTime := time.Now()
 
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -83,10 +87,9 @@ func handleAddContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// for now, just log the request
-	log.Printf("Adding container %s for probing. probe time: %d seconds", req.ContainerID, req.ProbeTime)
+	// log.Printf("Adding container %s for probing. probe time: %d seconds", req.ContainerID, req.ProbeTime)
 
-	if err := startMonitoring(req.ContainerID, req.ProbeTime); err != nil {
+	if err := startMonitoring(req); err != nil {
 		http.Error(w, "Failed to start monitoring container", http.StatusInternalServerError)
 		return
 	}
@@ -98,13 +101,13 @@ func handleAddContainer(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)	
 
-	log.Printf("Took %s to add container %s", time.Since(beginTime), req.ContainerID)
+	// log.Printf("Took %s to add container %s", time.Since(beginTime), req.ContainerID)
 
 	// log.Printf("Containers: %v", containers)
 	// DEBUG, will delete later
-	containersMu.RLock()
-	log.Printf("Monitoring %d containers", len(containers))
-	containersMu.RUnlock()
+	// containersMu.RLock()
+	// log.Printf("Monitoring %d containers", len(containers))
+	// containersMu.RUnlock()
 }
 
 func handleRemoveContainer(w http.ResponseWriter, r *http.Request) {
@@ -126,7 +129,13 @@ func handleRemoveContainer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("Removing container %s", req.ContainerID)
+	// Log container state before removal for debugging (only if container exists)
+	// containersMu.RLock()
+	// if container, ok := containers[req.ContainerID]; ok {
+	// 	log.Printf("[REMOVE REQUEST] Removing container %s (state: %s, currentLimit: %dMB, userMax: %dMB)", 
+	// 		req.ContainerID, container.State, container.CurrentLimit / 1024 / 1024, container.UserMax / 1024 / 1024)
+	// }
+	// containersMu.RUnlock()
 
 	if err := stopMonitoring(req.ContainerID); err != nil {
 		http.Error(w, "Failed to stop monitoring container", http.StatusInternalServerError)
@@ -141,6 +150,7 @@ func handleRemoveContainer(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
+// Container is touched upon invocation end
 func handleUpdateProbing(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -155,28 +165,33 @@ func handleUpdateProbing(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// update invocation count for the container
-	var invocationCount int64
-	var found bool
+	// var found bool
 
 	containersMu.Lock()
 	if container, ok := containers[req.ContainerID]; ok {
 		container.StepInvocationCount++ // aggregate to total upon stepping
-		invocationCount = container.InvocationCount + container.StepInvocationCount
-		found = true
-		
-		// TODO. decide whether to reset timer on invocation or not
-		// if container.State == ProbeProbing {
-		// 	container.ProbingStartTime = time.Now()
-		// }
+
+		if container.State == ProbeIdle &&
+			container.Category != CategoryNoDownsize &&
+			container.CurrentLimit > container.FinalTargetLimit {
+				// log.Printf("Waking up container %s from idle state", container.ContainerID)
+
+				container.State = ProbeProbing
+				container.ProbingStartTime = time.Now()
+		} else if container.State == ProbeThrottled && // throttle recovery logic
+			container.backoffCount > 0 {
+				container.backoffCount--
+				// log.Printf("Decreasing backoff count for container %s to %d", container.ContainerID, container.backoffCount)
+
+				// we do resume probing at the main fsm, updateProbingStates()
+		}
+		// found = true
 	}
 	containersMu.Unlock()
 
-	if found {
-		log.Printf("Invocation count for container %s: %d", req.ContainerID, invocationCount)
-	} else {
-		log.Printf("Container %s not found in monitoring map", req.ContainerID)
-	}
+	// if !found {
+	// 	log.Printf("Container %s not found in monitoring map", req.ContainerID)
+	// }
 }
 
 func handleGetReclaimedMemory(w http.ResponseWriter, r *http.Request) {
@@ -200,31 +215,104 @@ func handleGetReclaimedMemory(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func startMonitoring(containerID string, probeTime int) error {
+func startMonitoring(req ProbingRequest) error {
+	containerID := req.ContainerID
+	
+	// Use ActionStats metrics if available, otherwise use defaults
+	coldStartSensitivity := req.ColdStartSensitivity
+	if coldStartSensitivity == 0.0 {
+		coldStartSensitivity = 1.3 // Default value
+	}
+	
+	// Placeholder for history peak bytes (future use)
+	historyPeakBytes := int64(0)
+	// if req.HistoryPeakBytes > 0 {
+	//	historyPeakBytes = req.HistoryPeakBytes
+	// }
+	
 	// initialize epoll, only once
 	initEpoll()
 
 	// examine first invocation.
-	memoryMax, memoryPeak, memoryCur, err := getContainerSpecs(containerID)
+	memoryMax, memoryPeak, _, err := getContainerSpecs(containerID)
 	if err != nil {
 		log.Printf("Failed to start monitoring container %s: %v", containerID, err)
 		return err
 	}
 
-	// compute safety floor. TODO: use history info
-	floor := computeSafetyFloor(memoryMax, memoryPeak)
+	// default values
+	var nextTarget, ssthresh int64
+	var category ProbeCategory = CategoryMedium
+	var safetyMargin float64 = 1.20 // 20% headroom
 
-	// ssthresh init
-	ssthresh:= floor + (memoryMax - floor) / 2
-	if ssthresh < floor {
-		ssthresh = floor
+	// compute final target
+	finalTarget := computeFinalTarget(memoryMax, memoryPeak)
+	if historyPeakBytes > finalTarget {
+		finalTarget = historyPeakBytes
 	}
 
-	// next target init
-	// nextTarget, mode := nextProbeTarget(memoryMax, floor, ssthresh)
-	nextTarget, _ := nextProbeTarget(memoryMax, floor, ssthresh)
+	// Sensitivity Logics - use ActionStats coldstartSensitivity
+	if coldStartSensitivity > 1.0 {
+		// High sensitivity
+		safetyMargin = 1.70
+		// log.Printf("High sensitivity for container %s (sensitivity: %.3f)", containerID, coldStartSensitivity)
+	} else if coldStartSensitivity < 0.2 {
+		// Low sensitivity
+		safetyMargin = 1.45
+		category = CategoryLight
+		// log.Printf("Low sensitivity for container %s (sensitivity: %.3f)", containerID, coldStartSensitivity)
+	} else {
+		// log.Printf("Medium sensitivity for container %s (sensitivity: %.3f)", containerID, coldStartSensitivity)
+	}
+	
+	// Calculate ProbeInterval based on IAT
+	probeInterval := calculateProbeInterval(req.IAT)
+	
+	// Log received ActionStats metrics for debugging
+	// if req.IAT > 0 || req.CV > 0 {
+	// 	log.Printf("ActionStats for container %s: sensitivity=%.3f, iat=%.2fs, cv=%.3f, probeInterval=%.2fs",
+	// 		containerID, coldStartSensitivity, req.IAT, req.CV, probeInterval.Seconds())
+	// }
 
-	// setup psi fd for EPOLL
+	// history available
+	if historyPeakBytes > 0 {
+
+		smartStart := int64(float64(historyPeakBytes) * safetyMargin)
+		smartStart = (smartStart + 4095) & ^4095
+
+		// ssthresh: always based on finalTarget for consistency
+		ssthresh = int64(float64(finalTarget) * ssthreshMarginRatio)
+		if ssthresh > memoryMax {
+			ssthresh = memoryMax
+		}
+		if ssthresh < finalTarget {
+			ssthresh = finalTarget
+		}
+		ssthresh = (ssthresh + 4095) & ^4095 // page align
+
+		nextTarget = smartStart
+		if nextTarget < finalTarget {
+			nextTarget = finalTarget
+		}
+
+		// log.Printf("[Smart Init] %s: Hist=%dMB, Sens=%f -> Start=%dMB, Ssthresh=%dMB (based on finalTarget %dMB)",
+		// 	containerID, historyPeakBytes>>20, coldStartSensitivity, nextTarget >> 20, ssthresh >> 20, finalTarget >> 20)
+	} else {
+		// log.Printf("[DEFAULT INIT] final target: %dMB, safety margin: %f", finalTarget>>20, safetyMargin)
+		// ssthresh: always based on finalTarget for consistency
+		ssthresh = int64(float64(finalTarget) * ssthreshMarginRatio)
+		if ssthresh > memoryMax {
+			ssthresh = memoryMax
+		}
+		if ssthresh < finalTarget {
+			ssthresh = finalTarget
+		}
+		ssthresh = (ssthresh + 4095) & ^4095 // page align
+		nextTarget, _ = nextProbeTarget(memoryMax, finalTarget, ssthresh, coldStartSensitivity)
+		// log.Printf("[Default Init] %s: Hist=0MB, Sens=%f -> Start=%dMB, Ssthresh=%dMB (based on finalTarget %dMB)",
+		// 	containerID, coldStartSensitivity, nextTarget >> 20, ssthresh >> 20, finalTarget >> 20)
+	}
+
 	psiFD, err := setupPsiFD(containerID)
 	if err != nil {
 		log.Printf("Failed to setup psi fd for container %s: %v", containerID, err)
@@ -232,43 +320,42 @@ func startMonitoring(containerID string, probeTime int) error {
 	}
 
 	now := time.Now()
-
-	// put container in monitoring map
+	
+	// Calculate ProbeInterval based on IAT
+	// IAT가 짧으면 (빈번한 호출) → 짧은 interval로 빠르게 탐색
+	// IAT가 길면 (드문 호출) → 긴 interval로 안정적으로 탐색
+	probeInterval = calculateProbeInterval(req.IAT)
+	
 	containersMu.Lock()
 	container := &ContainerState{
 		ContainerID: containerID,
 		UserMax: memoryMax,
 		CurrentLimit: memoryMax,
 		TargetLimit: nextTarget,
-		FinalTargetLimit: floor,
+		FinalTargetLimit: finalTarget,
 		Ssthresh: ssthresh,
 		LastKnownPeak: memoryPeak,
+		Sensitivity: coldStartSensitivity,
+		IAT: req.IAT,
+		CV: req.CV,
 		InvocationCount: 0,
 		StepInvocationCount: 0,
-		Category: CategoryMedium,
+		Category: category,
 		State: ProbeProbing,
 		ProbingStartTime: now,
 		LastThrottleTime: time.Time{},
 		ThrottleCount: 0,
-		ProbeInterval: initialProbeInterval,
+		ProbeInterval: probeInterval,
 		LastCommitTime: now,
 		psiFD: psiFD,
 		lastThrottledLimit: memoryMax,
 		consecutiveThrottles: 0,
-		committed: false,
-		ProbeTime: probeTime,
+		LastCommittedLimit: memoryMax,
+		ProbeTime: req.ProbeTime,
 	}
 
 	if nextTarget == memoryMax {
 		container.State = ProbeIdle
-		container.committed = true
-		commitsMu.Lock()
-		commits = append(commits, ProbeCompleteReport{
-			ContainerID: containerID,
-			Downsized: false,
-			NewLimitBytes: memoryMax,
-		})
-		commitsMu.Unlock()
 	}
 	containers[containerID] = container
 	containersMu.Unlock()
@@ -282,22 +369,20 @@ func startMonitoring(containerID string, probeTime int) error {
 	setMemHigh(containerID, nextTarget)
 
 	// logging
-	log.Printf(
-		"Started monitoring container %s\n"+
-		"Memory max: %dMB\n"+
-		"Memory peak: %dMB\n"+
-		"Memory current: %dMB\n"+
-		"Safety floor: %dMB\n"+
-		"Ssthresh: %dMB\n"+
-		"Next target: %dMB]\n",
-		containerID, 
-		memoryMax / 1024 / 1024, 
-		memoryPeak / 1024 / 1024, 
-		memoryCur / 1024 / 1024, 
-		floor / 1024 / 1024, 
-		ssthresh / 1024 / 1024,
-		nextTarget / 1024 / 1024, 
-	)
+	// log.Printf(
+	// 	"Started monitoring container %s\n"+
+	// 	"Memory max: %dMB\n"+
+	// 	"Memory peak: %dMB\n"+
+	// 	"Final target: %dMB\n"+
+	// 	"Ssthresh: %dMB\n"+
+	// 	"Next target: %dMB\n",
+	// 	containerID, 
+	// 	memoryMax / 1024 / 1024, 
+	// 	memoryPeak / 1024 / 1024, 
+	// 	finalTarget / 1024 / 1024,
+	// 	ssthresh / 1024 / 1024,
+	// 	nextTarget / 1024 / 1024, 
+	// )
 	return nil
 }
 
@@ -305,15 +390,23 @@ func stopMonitoring(containerID string) error {
 	// remove from containers map
 	containersMu.Lock()
 	st, ok := containers[containerID]
+	// var stateBeforeRemoval ProbeState
 	if ok {
+		// stateBeforeRemoval = st.State
 		delete(containers, containerID)
 	}
 	containersMu.Unlock()
 
 	if !ok {
-		log.Printf("Container %s not found in monitoring map", containerID)
-		return fmt.Errorf("container %s not found in monitoring map", containerID)
+		// Container already removed or never added - this is normal in some cases
+		// (e.g., race condition, container removed before monitoring started, etc.)
+		// Don't log as error, just return silently
+		return nil
 	}
+
+	// restore memory.high to original UserMax (remove soft limit)
+	// This is important to ensure container is not left with a restrictive limit
+	setMemHigh(containerID, st.UserMax)
 
 	// remove from psi map
 	if st.psiFD != -1 { // valid psi fd
@@ -331,10 +424,11 @@ func stopMonitoring(containerID string) error {
 		}
 	}
 
-	containersMu.RLock()
-	count := len(containers)
-	containersMu.RUnlock()
-	log.Printf("Stopped monitoring container %s. %d containers remaining", containerID, count)
+	// containersMu.RLock()
+	// count := len(containers)
+	// containersMu.RUnlock()
+	// log.Printf("[STOP MONITORING] Stopped monitoring container %s. %d containers remaining (state was: %s, currentLimit: %dMB, userMax: %dMB)", 
+	// 	containerID, count, stateBeforeRemoval, st.CurrentLimit / 1024 / 1024, st.UserMax / 1024 / 1024)
 
 	return nil
 }
@@ -411,8 +505,47 @@ func updateProbingStates() {
 			continue
 		case ProbeProbing:
 			containersPerState[ProbeProbing]++
+
+			// implement intermediate commit if no traffic AND sufficient memory gain
+			timeSinceStart := now.Sub(container.ProbingStartTime)
+			if timeSinceStart > intermediateCommitNoTrafficDuration && container.StepInvocationCount == 0 {
+				// Check memory gain: must have saved enough memory to justify commit
+				savedBytes := container.LastCommittedLimit - container.CurrentLimit
+				
+				// Safety check: if no memory saved or LastCommittedLimit is invalid, skip commit
+				if savedBytes <= 0 || container.LastCommittedLimit <= 0 {
+					container.State = ProbeIdle
+					container.TargetLimit = container.CurrentLimit
+					// log.Printf("[PROBE PROBING] Container %s idle (no traffic for 15s, but invalid savedBytes: %dMB, LastCommittedLimit: %dMB)", 
+					// 	container.ContainerID, savedBytes / 1024 / 1024, container.LastCommittedLimit / 1024 / 1024)
+					continue
+				}
+				
+				savedRatio := float64(savedBytes) / float64(container.LastCommittedLimit)
+				
+				// Only commit if we have meaningful memory gain
+				hasMemoryGain := savedBytes >= intermediateCommitMinSavedBytes || savedRatio >= intermediateCommitMinSavedRatio
+				
+				if hasMemoryGain {
+					container.State = ProbeIdle
+					container.TargetLimit = container.CurrentLimit
+					// log.Printf("[PROBE PROBING] Intermediate commit for container %s with memory limit %dMB (no traffic for 15s, saved %dMB, %.1f%%)", 
+					// 	container.ContainerID, container.CurrentLimit / 1024 / 1024, savedBytes / 1024 / 1024, savedRatio * 100)
+					maybeCommit(container, now)
+					continue
+				} else {
+					// Not enough memory gain, just transition to idle without commit
+					container.State = ProbeIdle
+					container.TargetLimit = container.CurrentLimit
+					// log.Printf("[PROBE PROBING] Container %s idle (no traffic for 15s, but insufficient memory gain: %dMB saved, %.1f%%)", 
+					// 	container.ContainerID, savedBytes / 1024 / 1024, savedRatio * 100)
+					continue
+				}
+			}
+
 			// probing in progress
-			if now.Sub(container.ProbingStartTime) < container.ProbeInterval ||
+			// if now.Sub(container.ProbingStartTime) < container.ProbeInterval ||
+			if timeSinceStart < container.ProbeInterval ||
 				container.StepInvocationCount < minStepInvocationCount {
 				continue
 			}
@@ -422,21 +555,23 @@ func updateProbingStates() {
 			container.StepInvocationCount = 0
 			container.consecutiveThrottles = 0
 			container.CurrentLimit = container.TargetLimit
-			container.LastCommitTime = now
+			// Note: LastCommitTime is only updated in maybeCommit() when actual commit happens
 
 			// Probing complete (final target reached)
 			if container.CurrentLimit <= container.FinalTargetLimit {
 				container.State = ProbeIdle
 				container.TargetLimit = container.CurrentLimit
-				log.Printf("Probing complete for container %s with memory limit %dMB", container.ContainerID, container.TargetLimit / 1024 / 1024)
+				log.Printf("[COMPLETE] Container %s: reached final target %dMB", container.ContainerID, container.TargetLimit / 1024 / 1024)
 				continue
 			}
 
-			// Next Probing Step
-			// newTarget, mode := nextProbeTarget(container.CurrentLimit,
-			newTarget, _ := nextProbeTarget(container.CurrentLimit,
+			/* Normal Probing Flow */
+
+			// Next Probing Step: limit & mode
+			newTarget, mode := nextProbeTarget(container.CurrentLimit,
 				container.FinalTargetLimit,
 				container.Ssthresh,
+				container.Sensitivity,
 			)
 			container.ProbingStartTime = now
 
@@ -444,32 +579,49 @@ func updateProbingStates() {
 			if newTarget >= container.CurrentLimit {
 				container.State = ProbeIdle
 				container.TargetLimit = container.CurrentLimit
-				log.Printf("Can't make further progress for container %s with memory limit %dMB", container.ContainerID, container.TargetLimit / 1024 / 1024)
+				log.Printf("[STUCK] Container %s: can't make progress at %dMB", container.ContainerID, container.TargetLimit / 1024 / 1024)
 				continue
 			}
 
+			// Adjust ProbeInterval based on phase and IAT
+			// Base interval is calculated from IAT, then adjusted by phase
+			baseInterval := calculateProbeInterval(container.IAT)
+			if mode == "QuickStart" {
+				// QuickStart: faster probing (0.5x of base interval)
+				container.ProbeInterval = time.Duration(float64(baseInterval) * 0.5)
+				// Ensure minimum 500ms for QuickStart
+				if container.ProbeInterval < 500*time.Millisecond {
+					container.ProbeInterval = 500 * time.Millisecond
+				}
+			} else {
+				// OomAvoidance: accelerate by using shorter interval (0.7x of base)
+				// This speeds up convergence while still maintaining some stability
+				container.ProbeInterval = time.Duration(float64(baseInterval) * 0.7)
+				// Ensure minimum 1s for OomAvoidance (slightly faster than QuickStart minimum)
+				if container.ProbeInterval < 1*time.Second {
+					container.ProbeInterval = 1 * time.Second
+				}
+			}
+
 			container.TargetLimit = newTarget
-			// container.ProbeInterval = container.ProbeInterval * 2 // exponential backoff
 
 			changes = append(changes, memChange{id: container.ContainerID, limit: newTarget})
-			log.Printf("Lowered probing container %s with memory limit %dMB", container.ContainerID, newTarget / 1024 / 1024)
+
+			log.Printf("[PROBE] Container %s: %dMB (mode: %s)", container.ContainerID, newTarget / 1024 / 1024, mode)
 
 
 		case ProbeThrottled:
 			containersPerState[ProbeThrottled]++
-			// current mem.high == userMax (throttled)
-			// drain bursts for a while, then decide whether to resume probing
-			if now.Sub(container.LastThrottleTime) < effectiveBackoffInterval(container) {
+
+			// handled at updateProbing()
+			if container.backoffCount > 0 {
 				continue
 			}
-
-			container.StepInvocationCount = 0
 
 			// Decide disable probing
 			if shouldDisableProbing(container) {
 				// a noisy container. disable probing for this session.
-				container.committed = true
-				container.State = ProbeDisabled
+				container.LastCommittedLimit = container.UserMax
 				container.TargetLimit = container.UserMax
 				commitsMu.Lock()
 				commits = append(commits, ProbeCompleteReport{
@@ -479,19 +631,109 @@ func updateProbingStates() {
 				})
 				commitsMu.Unlock()
 				changes = append(changes, memChange{id: container.ContainerID, limit: container.UserMax})
-				log.Printf("Disabled probing for container %s with memory limit %dMB", container.ContainerID, container.UserMax / 1024 / 1024)
+				
+				containerID := container.ContainerID
+				reason := getDisableReason(container)
+				log.Printf("Disabled probing for container %s with memory limit %dMB, stopping monitoring (reason: %s)", containerID, container.UserMax / 1024 / 1024, reason)
+				
+				// Note: We'll call stopMonitoring after releasing the lock
+				// to avoid deadlock and ensure proper cleanup
+				containersMu.Unlock()
+				
+				// Notify bridge that probing is disabled BEFORE stopping monitoring
+				// This ensures invoker gets the notification while container still exists
+				notifyProbeDisabled(containerID, reason)
+				
+				if err := stopMonitoring(containerID); err != nil {
+					log.Printf("Failed to stop monitoring disabled container %s: %v", containerID, err)
+				}
+				containersMu.Lock()
 				continue
 			}
 
-			// continue probing, but backoff by (max - current) / 2
-			backoff := (container.UserMax - container.CurrentLimit) / 2
-			container.TargetLimit = container.CurrentLimit - backoff
+			// Hybrid resume strategy:
+			// 1. First throttle (consecutiveThrottles == 1): Assume spike, resume near throttle limit
+			// 2. Consecutive throttles (>= 2): Assume workload shift, check memory.peak and adjust upward
+			var resumeLimit int64
+			var resumeReason string
+			
+			if container.consecutiveThrottles == 1 {
+				// Option 1: Spike assumption - resume near throttle limit
+				if container.lastThrottledLimit > 0 {
+					// Start from throttle limit + safety margin (15%), but don't exceed ssthresh
+					resumeLimit = int64(float64(container.lastThrottledLimit) * 1.15)
+					resumeLimit = (resumeLimit + 4095) & ^4095 // page align
+					
+					// Don't start higher than ssthresh
+					if resumeLimit > container.Ssthresh {
+						resumeLimit = container.Ssthresh
+					}
+					
+					// Don't start lower than final target
+					if resumeLimit < container.FinalTargetLimit {
+						resumeLimit = container.FinalTargetLimit
+					}
+					resumeReason = "spike_assumption"
+				} else {
+					// Fallback to ssthresh if lastThrottledLimit not available
+					resumeLimit = container.Ssthresh
+					resumeReason = "spike_assumption_fallback"
+				}
+			} else {
+				// Option 2: Workload shift assumption - check memory.peak and adjust
+				_, memoryPeak, _, err := getContainerSpecs(container.ContainerID)
+				if err != nil {
+					log.Printf("Failed to read memory.peak for container %s during resume: %v, using ssthresh", container.ContainerID, err)
+					resumeLimit = container.Ssthresh
+					resumeReason = "workload_shift_fallback"
+				} else {
+					// Check if peak increased (workload shift)
+					if memoryPeak > container.LastKnownPeak && container.LastKnownPeak > 0 {
+						// Peak increased: recalculate FinalTargetLimit based on new peak
+						newTarget := computeFinalTarget(container.UserMax, memoryPeak)
+						container.FinalTargetLimit = newTarget
+						container.LastKnownPeak = memoryPeak
+						
+						// Recalculate ssthresh based on new FinalTargetLimit (they move together)
+						newSsthresh := int64(float64(newTarget) * ssthreshMarginRatio)
+						if newSsthresh > container.UserMax {
+							newSsthresh = container.UserMax
+						}
+						if newSsthresh < newTarget {
+							newSsthresh = newTarget
+						}
+						newSsthresh = (newSsthresh + 4095) & ^4095 // page align
+						container.Ssthresh = newSsthresh
+						
+						// Resume from new target or ssthresh, whichever is higher
+						if newTarget > container.Ssthresh {
+							resumeLimit = newTarget
+						} else {
+							resumeLimit = container.Ssthresh
+						}
+						resumeReason = fmt.Sprintf("workload_shift_peak_increased_%dMB", memoryPeak>>20)
+					} else {
+						// Peak unchanged: moderate upward adjustment (use ssthresh)
+						resumeLimit = container.Ssthresh
+						resumeReason = "workload_shift_peak_unchanged"
+					}
+				}
+			}
+
+			container.TargetLimit = resumeLimit
+			container.CurrentLimit = resumeLimit
+
+			container.StepInvocationCount = 0
 			container.ProbingStartTime = now
-			container.ProbeInterval = initialProbeInterval
-			container.consecutiveThrottles = 0
+			// Recalculate ProbeInterval based on IAT (may have changed, but typically stable)
+			container.ProbeInterval = calculateProbeInterval(container.IAT)
+			// Note: consecutiveThrottles is NOT reset here - it's only reset after successful probing step
+			// This allows tracking if container throttles again soon after resume
 
 			changes = append(changes, memChange{id: container.ContainerID, limit: container.TargetLimit})
-			log.Printf("Resumed probing container %s with memory limit %dMB", container.ContainerID, container.TargetLimit / 1024 / 1024)
+			log.Printf("[RESUMED] Container %s resumed at %dMB (from %dMB, reason: %s)", 
+				container.ContainerID, container.TargetLimit / 1024 / 1024, 
+				container.lastThrottledLimit / 1024 / 1024, resumeReason)
 
 			container.State = ProbeProbing
 
@@ -505,12 +747,24 @@ func updateProbingStates() {
 	containersMu.Unlock()
 
 	// apply changes
+	// Note: changes are applied after releasing the lock to avoid holding it during I/O.
+	// Container may be removed between lock release and setMemHigh, but setMemHigh will
+	// fail gracefully if container doesn't exist.
 	for _, change := range changes {
-		setMemHigh(change.id, change.limit)
-		log.Printf("Set memory limit for container %s to %dMB", change.id, change.limit / 1024 / 1024)
+		// Verify container still exists before applying change
+		containersMu.RLock()
+		_, exists := containers[change.id]
+		containersMu.RUnlock()
+		
+		if exists {
+			setMemHigh(change.id, change.limit)
+			log.Printf("Set memory limit for container %s to %dMB", change.id, change.limit / 1024 / 1024)
+		} else {
+			log.Printf("Container %s no longer exists, skipping memory limit change", change.id)
+		}
 	}
 
-	log.Printf("Containers per state: %v", containersPerState)
+	// log.Printf("Containers per state: %v", containersPerState)
 }
 
 func snapshotReclaimedMemory() ReclaimedSnapshot{

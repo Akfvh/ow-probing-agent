@@ -10,6 +10,14 @@ type HealthCheckResponse struct {
 type ProbingRequest struct {
 	ContainerID string `json:"container_id"`
 	ProbeTime int `json:"probe_time"`
+
+	// ActionStats metrics for probing parameter adjustment (optional)
+	ColdStartSensitivity float64 `json:"coldstart_sensitivity,omitempty"`
+	IAT float64 `json:"iat,omitempty"` // Inter-arrival time in seconds
+	CV float64 `json:"cv,omitempty"` // Coefficient of variation
+	
+	// Placeholder for future use
+	// HistoryPeakBytes int64 `json:"history_peak_bytes,omitempty"`
 }
 type ProbingResponse struct {
 	Status string `json:"status"`
@@ -24,4 +32,9 @@ type ProbeCompleteReport struct {
 
 type ReclaimedBytesResponse struct {
 	ReclaimedBytes int64 `json:"reclaimed_bytes"`
+}
+
+type ProbeDisabledReport struct {
+	ContainerID string `json:"container_id"`
+	Reason string `json:"reason"`
 }

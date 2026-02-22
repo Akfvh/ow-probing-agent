@@ -37,6 +37,7 @@ func setupPsiFD(containerID string) (int, error) {
 
 	f, err := os.OpenFile(cgroupPathFor(containerID, "memory.pressure"), os.O_RDWR, 0)
 	if err != nil {
+		f.Close()
 		return -1, err
 	}
 
@@ -51,7 +52,8 @@ func setupPsiFD(containerID string) (int, error) {
 
 	// setup trigger
 	if _, err := f.WriteString(trigger); err != nil {
-		return -1, err
+		f.Close()
+		return -1, fmt.Errorf("failed to write trigger: %v", err)
 	}
 
 	// Rewind file pointer
@@ -116,6 +118,8 @@ func handleMemoryPressureEvent(containerID string, fd int, ev unix.EpollEvent) {
 			}
 			if err != nil {
 				log.Printf("Failed to read from psi fd for container %s: %v", containerID, err)
+				stopMonitoring(containerID)
+				return
 			}
 			break
 		}
